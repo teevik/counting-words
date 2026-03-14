@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::generate::generate_corpus;
+use rayon::prelude::*;
 use std::arch::aarch64::*;
 
 mod generate;
@@ -12,11 +13,10 @@ fn is_whitespace(byte: u8) -> bool {
     }
 }
 
-fn count_words_naive(corpus: &[u8]) -> usize {
+fn count_words_naive(input: &[u8], mut previous_whitespace: bool) -> usize {
     let mut count = 0;
-    let mut previous_whitespace = true;
 
-    for &byte in corpus {
+    for &byte in input {
         let current_whitespace = is_whitespace(byte);
 
         if !current_whitespace && previous_whitespace {
@@ -29,11 +29,14 @@ fn count_words_naive(corpus: &[u8]) -> usize {
     count
 }
 
-unsafe fn count_words_simd(corpus: &[u8]) -> usize {
+unsafe fn count_words_simd(input: &[u8], prev_whitespace: bool) -> usize {
     let mut words = 0;
 
-    // Initialize the previous whitespace mask to be all `true`
-    let mut prev_whitespace = vdupq_n_u8(0b1111_1111);
+    // Initialize the previous whitespace mask
+    let mut prev_whitespace = vdupq_n_u8(match prev_whitespace {
+        true => 0b1111_1111,
+        false => 0b0000_0000,
+    });
 
     // Broadcasted filters for each whitespace character
     let whitespace_filters = [
@@ -46,7 +49,7 @@ unsafe fn count_words_simd(corpus: &[u8]) -> usize {
     ];
 
     // 128 bytes at a time
-    let mut chunks = corpus.chunks_exact(16);
+    let mut chunks = input.chunks_exact(16);
 
     for chunk in &mut chunks {
         // Load into vector
@@ -81,36 +84,49 @@ unsafe fn count_words_simd(corpus: &[u8]) -> usize {
     // Scalar solution for the remainder
     let remainder = chunks.remainder();
     if !remainder.is_empty() {
-        let mut prev_ws = vgetq_lane_u8(prev_whitespace, 15) != 0;
-
-        for &byte in remainder {
-            let current_ws = is_whitespace(byte);
-            if !current_ws && prev_ws {
-                words += 1;
-            }
-            prev_ws = current_ws;
-        }
+        let prev_whitepsace = vgetq_lane_u8(prev_whitespace, 15) != 0;
+        words += count_words_naive(remainder, prev_whitepsace);
     }
 
     words
 }
 
+unsafe fn count_words_simd_parallel(input: &[u8]) -> usize {
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1MiB
+
+    input
+        .par_chunks(CHUNK_SIZE)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let prev_whitespace = (i == 0) || is_whitespace(input[i * CHUNK_SIZE - 1]);
+
+            count_words_simd(chunk, prev_whitespace)
+        })
+        .sum()
+}
+
 fn main() {
     let start = std::time::Instant::now();
-    let corpus = generate_corpus();
+    let input = generate_corpus();
     println!("Generated 1GiB of text in {:?}", start.elapsed());
 
     // Assert 16-byte alignment
-    assert_eq!(corpus.as_ptr() as usize % 16, 0);
+    assert_eq!(input.as_ptr() as usize % 16, 0);
 
     let start = std::time::Instant::now();
-    let count_naive = count_words_naive(&corpus);
+    let count_naive = count_words_naive(&input, true);
     println!("count_words_naive: {:?}", start.elapsed());
 
     let start = std::time::Instant::now();
-    let count_simd = unsafe { count_words_simd(&corpus) };
+    let count_simd = unsafe { count_words_simd(&input, true) };
     println!("count_words_simd: {:?}", start.elapsed());
 
-    dbg!(count_naive, count_simd);
+    let start = std::time::Instant::now();
+    let count_simd_parallel = unsafe { count_words_simd_parallel(&input) };
+    println!("count_words_simd: {:?}", start.elapsed());
+    dbg!(count_simd_parallel);
+
+    dbg!(count_naive, count_simd, count_simd_parallel);
     assert_eq!(count_naive, count_simd);
+    assert_eq!(count_simd, count_simd_parallel);
 }
